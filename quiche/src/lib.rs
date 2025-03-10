@@ -804,6 +804,8 @@ pub struct Config {
     dgram_recv_max_queue_len: usize,
     dgram_send_max_queue_len: usize,
 
+    dgram_congestion_controlled: bool,
+
     path_challenge_recv_max_queue_len: usize,
 
     max_send_udp_payload_size: usize,
@@ -872,6 +874,8 @@ impl Config {
 
             dgram_recv_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
+
+            dgram_congestion_controlled: true,
 
             path_challenge_recv_max_queue_len:
                 DEFAULT_MAX_PATH_CHALLENGE_RX_QUEUE_LEN,
@@ -1308,6 +1312,10 @@ impl Config {
         self.dgram_send_max_queue_len = send_queue_len;
     }
 
+    pub fn set_dgram_congestion_controlled(&mut self, enabled: bool) {
+        self.dgram_congestion_controlled = enabled;
+    }
+
     /// Configures the max number of queued received PATH_CHALLENGE frames.
     ///
     /// When an endpoint receives a PATH_CHALLENGE frame and the queue is full,
@@ -1574,6 +1582,8 @@ pub struct Connection {
     /// DATAGRAM queues.
     dgram_recv_queue: dgram::DatagramQueue,
     dgram_send_queue: dgram::DatagramQueue,
+
+    dgram_congestion_controlled: bool,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -2033,6 +2043,8 @@ impl Connection {
             dgram_send_queue: dgram::DatagramQueue::new(
                 config.dgram_send_max_queue_len,
             ),
+
+            dgram_congestion_controlled: config.dgram_congestion_controlled,
 
             emit_dgram: true,
 
@@ -3836,12 +3848,20 @@ impl Connection {
             }
         }
 
-        // Limit output packet size by congestion window size.
-        left = cmp::min(
-            left,
-            // Bytes consumed by ACK frames.
-            cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
-        );
+        
+        let cwnd_diff = {
+            // Limit output packet size by congestion window size.
+            let left_cwnd = cwnd_available
+                .saturating_sub(left_before_packing_ack_frame - left);
+
+            if left_cwnd < left {
+                let diff = left - left_cwnd;
+                left = left_cwnd;
+                diff
+            } else {
+                0
+            }
+        };
 
         let mut challenge_data = None;
 
@@ -4302,7 +4322,8 @@ impl Connection {
             left > frame::MAX_DGRAM_OVERHEAD &&
             !is_closing &&
             path.active() &&
-            do_dgram
+            do_dgram &&
+            self.dgram_congestion_controlled
         {
             if let Some(max_dgram_payload) = max_dgram_len {
                 while let Some(len) = self.dgram_send_queue.peek_front_len() {
@@ -4541,6 +4562,99 @@ impl Connection {
             if push_frame_to_pkt!(b, frames, frame, left) {
                 in_flight = true;
             }
+        }
+
+        if frames.is_empty() && !self.dgram_congestion_controlled {
+            left += cwnd_diff;
+
+            if (pkt_type == packet::Type::Short
+                || pkt_type == packet::Type::ZeroRTT) &&
+                left > frame::MAX_DGRAM_OVERHEAD &&
+                !is_closing &&
+                path.active()
+            {
+                if let Some(max_dgram_payload) = max_dgram_len {
+                    while let Some(len) = self.dgram_send_queue.peek_front_len() {
+                        let hdr_off = b.off();
+                        let hdr_len = 1 + // frame type
+                        2; // length, always encode as 2-byte varint
+
+                        if (hdr_len + len) <= left {
+                            // Front of the queue fits this packet, send it.
+                            match self.dgram_send_queue.pop() {
+                                Some(data) => {
+                                    // Encode the frame.
+                                    //
+                                    // Instead of creating a `frame::Frame` object,
+                                    // encode the frame directly into the packet
+                                    // buffer.
+                                    //
+                                    // First we reserve some space in the output
+                                    // buffer for writing the frame header (we
+                                    // assume the length field is always a 2-byte
+                                    // varint as we don't know the value yet).
+                                    //
+                                    // Then we emit the data from the DATAGRAM's
+                                    // buffer.
+                                    //
+                                    // Finally we go back and encode the frame
+                                    // header with the now available information.
+                                    let (mut dgram_hdr, mut dgram_payload) =
+                                        b.split_at(hdr_off + hdr_len)?;
+
+                                    dgram_payload.as_mut()[..len]
+                                        .copy_from_slice(&data);
+
+                                    // Encode the frame's header.
+                                    //
+                                    // Due to how `OctetsMut::split_at()` works,
+                                    // `dgram_hdr` starts from the initial offset
+                                    // of `b` (rather than the current offset), so
+                                    // it needs to be advanced to the initial frame
+                                    // offset.
+                                    dgram_hdr.skip(hdr_off)?;
+
+                                    frame::encode_dgram_header(
+                                        len as u64,
+                                        &mut dgram_hdr,
+                                    )?;
+
+                                    // Advance the packet buffer's offset.
+                                    b.skip(hdr_len + len)?;
+
+                                    let frame = frame::Frame::DatagramHeader {
+                                        length: len,
+                                    };
+
+                                    if push_frame_to_pkt!(b, frames, frame, left)
+                                    {
+                                        ack_eliciting = true;
+                                        // Mark packets containing only Datagram frames as not in-flight.
+                                        // This essentially disables congestion control for Datagram frames.
+                                        in_flight = false;
+                                        dgram_emitted = true;
+                                        let _ = self
+                                            .dgram_sent_count
+                                            .saturating_add(1);
+                                        let _ = path
+                                            .dgram_sent_count
+                                            .saturating_add(1);
+                                    }
+                                },
+
+                                None => continue,
+                            };
+                        } else if len > max_dgram_payload {
+                            // This dgram frame will never fit. Let's purge it.
+                            self.dgram_send_queue.pop();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            left = left.saturating_sub(cwnd_diff);
         }
 
         // Pad payload so that it's always at least 4 bytes.
