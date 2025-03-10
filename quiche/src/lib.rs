@@ -4538,13 +4538,6 @@ impl Connection {
             path.recovery.ping_sent(epoch);
         }
 
-        if frames.is_empty() {
-            // When we reach this point we are not able to write more, so set
-            // app_limited to false.
-            path.recovery.update_app_limited(false);
-            return Err(Error::Done);
-        }
-
         // When coalescing a 1-RTT packet, we can't add padding in the UDP
         // datagram, so use PADDING frames instead.
         //
@@ -4655,6 +4648,13 @@ impl Connection {
             }
 
             left = left.saturating_sub(cwnd_diff);
+        }
+
+        if frames.is_empty() {
+            // When we reach this point we are not able to write more, so set
+            // app_limited to false.
+            path.recovery.update_app_limited(false);
+            return Err(Error::Done);
         }
 
         // Pad payload so that it's always at least 4 bytes.
