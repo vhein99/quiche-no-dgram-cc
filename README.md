@@ -1,3 +1,8 @@
+# ⚠️ WARNING: Experimental Fork ⚠️
+
+**This fork is experimental and not intended for production use.**  
+Please proceed with caution and consider using the original repository for production environments.
+
 ![quiche](quiche.svg)
 
 [![crates.io](https://img.shields.io/crates/v/quiche.svg)](https://crates.io/crates/quiche)
